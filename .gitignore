@@ -1,0 +1,9 @@
+__pycache__
+checkpoints/*.pth
+corpus.pkl
+tkn_ids_to_words.pkl
+tkn_words_to_ids.pkl
+hacker_news_titles
+hacker_news_text
+wandb
+text8
