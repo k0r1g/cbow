@@ -1,24 +1,17 @@
-## Cbow
+Time is super short. 
 
 
-```sh
-$ mkdir -p ~/miniconda3
-$ wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda3/miniconda.sh
-$ bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
-$ rm ~/miniconda3/miniconda.sh
-$ source ~/miniconda3/bin/activate
-$ conda init --all
-```
+Plan: 
 
-```sh
-$ conda create --name wrd python=3.11 -y
-$ conda activate wrd
-$ pip install torch wandb
-```
+- just tokenise hacker news 
+- load pre-trained Word2Vec model
+- ensure we save everything on huggingface
+- create a plan for specifically how we should use docker and the external server to push this code (have chatGPT do this)
+
+- finetune model on hacker news -> save to hackernews 
+- randomly sub-sample 0 score posts so that there are an equal number to posts that have 1+ posts 
+- train model 
+- expose as an api 
 
 
-```sh
-$ python 00_train_tkn.py
-$ python 01_train_w2v.py
-$ python 02_train_reg.py
-```
+then do a bunch of visualisation 

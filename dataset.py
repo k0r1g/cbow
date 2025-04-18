@@ -1,40 +1,66 @@
-#
-#
-#
-import torch
+# dataset.py – only class definitions
+# --------------------------------------------------
+# Minimal dataset module that exposes *only* torch
+# Dataset classes (no executable code, no helper
+# functions, no tests). Import it anywhere without
+# side‑effects.
+
+from __future__ import annotations
+
 import pickle
+from pathlib import Path
+from typing import List, Tuple
+
+import torch
+
+__all__ = [
+    "HNTitles",
+    "HNTitlesWithScore",
+]
+
+# ---------------------------------------------------------------------------
+# Utility to load a pickle; keeps code DRY but stays internal
+# ---------------------------------------------------------------------------
+
+def _load_pickle(path: str | Path):
+    return pickle.load(open(Path(path), "rb"))
 
 
-#
-#
-#
-class Wiki(torch.utils.data.Dataset):
-  def __init__(self):
-    self.vocab_to_int = pickle.load(open('./tkn_words_to_ids.pkl', 'rb'))
-    self.int_to_vocab = pickle.load(open('./tkn_ids_to_words.pkl', 'rb'))
-    self.corpus = pickle.load(open('./corpus.pkl', 'rb'))
-    self.tokens = [self.vocab_to_int[word] for word in self.corpus]
+# ---------------------------------------------------------------------------
+# 1️⃣  Hacker News titles – variable‑length token sequences
+# ---------------------------------------------------------------------------
+class HNTitles(torch.utils.data.Dataset):
+    """Iterable of padded / unpadded token‑ID sequences for each HN title."""
 
-  def __len__(self):
-    return len(self.tokens)
+    def __init__(self, tokens_path: str | Path = "title_token_ids.pkl"):
+        self.title_ids: List[List[int]] = _load_pickle(tokens_path)
 
-  def __getitem__(self, idx: int):
-    ipt = self.tokens[idx]
-    prv = self.tokens[idx-2:idx]
-    nex = self.tokens[idx+1:idx+3]
-    if len(prv) < 2: prv = [0] * (2 - len(prv)) + prv
-    if len(nex) < 2: nex = nex + [0] * (2 - len(nex))
-    return torch.tensor(prv + nex), torch.tensor([ipt])
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self.title_ids)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:  # type: ignore[override]
+        return torch.tensor(self.title_ids[idx], dtype=torch.long)
 
 
-#
-#
-#
-if __name__ == '__main__':
-  ds = Wiki()
-  print(ds.tokens[:15])
-  # print(ds[0])
-  print(ds[5])
-  dl = torch.utils.data.DataLoader(dataset=ds, batch_size=3)
-  ex = next(iter(dl))
-  print(ex)
+# ---------------------------------------------------------------------------
+# 2️⃣  (tokens, score) pairs – for regression tasks
+# ---------------------------------------------------------------------------
+class HNTitlesWithScore(torch.utils.data.Dataset):
+    """Dataset yielding (token_ids, score) tuples."""
+
+    def __init__(
+        self,
+        tokens_path: str | Path = "title_token_ids.pkl",
+        scores_path: str | Path = "scores.pkl",
+    ):
+        self.title_ids: List[List[int]] = _load_pickle(tokens_path)
+        self.scores: torch.Tensor = torch.tensor(_load_pickle(scores_path), dtype=torch.float32)
+        assert len(self.title_ids) == len(self.scores), "tokens & scores length mismatch"
+
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self.scores)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
+        ids = torch.tensor(self.title_ids[idx], dtype=torch.long)
+        score = self.scores[idx].unsqueeze(0)  # keep shape (1,)
+        return ids, score

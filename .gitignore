@@ -7,3 +7,21 @@ hacker_news_titles
 hacker_news_text
 wandb
 text8
+
+.env
+
+
+# Python cache files
+*.py[cod]
+*$py.class
+
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/

@@ -1,0 +1,12 @@
+# Required Packages
+fastapi
+uvicorn
+datasets
+jupyter
+notebook 
+ipykernel
+wandb
+
+# Word2Vec Requirements
+torch>=2.0.0
+tqdm>=4.65.0
