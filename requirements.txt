@@ -6,6 +6,13 @@ jupyter
 notebook 
 ipykernel
 wandb
+torch
+gensim
+pandas
+numpy
+nltk
+pydantic
+
 
 # Word2Vec Requirements
 torch>=2.0.0
