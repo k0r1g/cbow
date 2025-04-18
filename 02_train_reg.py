@@ -55,6 +55,7 @@ EPOCHS = 5
 BATCH_SIZE = 512
 LR = 3e-4  # Fixed the dash character
 HUBER_DELTA = 10.0
+SEED = 42
 
 # ---------------------------------------------------------------------------
 # 1️⃣  Fetch data (title, score, time) & build DataFrame
@@ -147,10 +148,20 @@ print("Original Title:", balanced.loc[sample_idx, 'title'])
 print("Token IDs:", balanced.loc[sample_idx, 'ids'])
 
 # ---------------------------------------------------------------------------
-# 5️⃣  Train/val split (80/20)
+# 5️⃣  Train/val/test split (80/10/10)
 # ---------------------------------------------------------------------------
-train_df = balanced.sample(frac=0.8, random_state=42)
-val_df = balanced.drop(train_df.index)
+# First, split into 80% train and 20% temporary (for val + test)
+train_df = balanced.sample(frac=0.8, random_state=SEED)
+temp_df = balanced.drop(train_df.index)
+
+# Now split the temporary 20% into 10% validation and 10% test (50% of temp_df)
+val_df = temp_df.sample(frac=0.5, random_state=SEED)
+test_df = temp_df.drop(val_df.index)
+
+print("\nData Split:")
+print(f"  Train samples: {len(train_df):,}")
+print(f"  Validation samples: {len(val_df):,}")
+print(f"  Test samples: {len(test_df):,}")
 
 # ---------------------------------------------------------------------------
 # 6️⃣  DataLoader helpers
@@ -193,6 +204,10 @@ train_dl = torch.utils.data.DataLoader(
 )
 val_dl = torch.utils.data.DataLoader(
     HNRegDataset(val_df), batch_size=BATCH_SIZE, shuffle=False, collate_fn=pad_collate
+)
+# Create DataLoader for the test set
+test_dl = torch.utils.data.DataLoader(
+    HNRegDataset(test_df), batch_size=BATCH_SIZE, shuffle=False, collate_fn=pad_collate
 )
 
 # ---------------------------------------------------------------------------
@@ -271,8 +286,50 @@ timestamp = datetime.datetime.now().strftime('%Y_%m_%d__%H_%M_%S')
 ckpt_out = f"checkpoints/{timestamp}.reg.pth"
 Path("checkpoints").mkdir(exist_ok=True)
 torch.save(reg.state_dict(), ckpt_out)
-print("Saved regressor to", ckpt_out)
+print("Saved final regressor to", ckpt_out)
+wip_ckpt_path = Path(ckpt_out) # Keep track of the saved path
+wip_cbow_ckpt = CBOW_CKPT # Keep track of the CBOW model used
 wandb.finish()
+
+# ---------------------------------------------------------------------------
+# 🔟 Final Evaluation on Test Set
+# ---------------------------------------------------------------------------
+print("\nStarting final evaluation on the test set...")
+
+# Load the saved model state (ensure we test the saved version)
+final_regressor = model.Regressor(emb_dim + extra_dim)
+final_regressor.load_state_dict(torch.load(wip_ckpt_path))
+final_regressor = final_regressor.to(device)
+final_regressor.eval() # Set to evaluation mode
+
+# Load the CBOW model used during training (ensure consistency)
+# Use wip_cbow_ckpt which was determined before training loop
+final_cbow = model.CBOW(wip_cbow_ckpt, trainable=False).eval().to(device)
+
+test_losses = []
+with torch.no_grad():
+    pbar_test = tqdm.tqdm(test_dl, desc="Testing")
+    for tokens, extra, y in pbar_test:
+        tokens, extra, y = tokens.to(device), extra.to(device), y.to(device)
+        
+        # Get embeddings from the consistent CBOW model
+        emb = final_cbow.emb(tokens)
+        mask = (tokens != PAD_IDX).unsqueeze(-1)
+        mean_emb = (emb * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-9)
+        
+        # Combine features and predict
+        x = torch.cat([mean_emb, extra], dim=1)
+        y_hat = final_regressor(x)
+        
+        # Calculate loss
+        loss = criterion(y_hat, y)
+        test_losses.append(loss.item())
+        pbar_test.set_postfix({"batch_loss": f"{loss.item():.4f}"})
+
+final_test_loss = float(np.mean(test_losses))
+print(f"\n---")
+print(f"✅ Final Test Loss: {final_test_loss:.4f}")
+print(f"---")
 
 # ---------------------------------------------------------------------------
 # Upload the final model to HuggingFace
