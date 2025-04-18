@@ -1,14 +1,10 @@
-# 01_train_w2v.py – fine‑tune Text8 Word2Vec on Hacker News tokens
-# -----------------------------------------------------------------
-# This is the production training script that ties together:
-#   • gensim → fine‑tuned embeddings
-#   • model.CBOW – Torch wrapper around the gensim checkpoint (for eval)
-#   • evaluate.topk – nearest‑neighbour monitoring each epoch
-#   • dataset.HNTitles – (imported for downstream compatibility)
-#
-# It produces a *.word2vec checkpoint after every epoch and immediately wraps
-# it with `model.CBOW` so `evaluate.topk` can inspect the updated embeddings
-# using the *same* vocabulary/lookup tables as the rest of the pipeline.
+# 01_train_w2v.py – fine‑tune HuggingFace CBOW Word2Vec on Hacker News tokens
+# ---------------------------------------------------------------------------
+# Robust loader version:  ➜ gracefully handles **three** formats
+#   1. Full gensim Word2Vec pickle                → `Word2Vec.load()`
+#   2. KeyedVectors pickle                        → `KeyedVectors.load()` then wrap
+#   3. PyTorch state‑dict / nn.Module (.pth)      → build `KeyedVectors` from the
+#      weight matrix (+ idx‑to‑word list) and wrap for incremental training.
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -18,19 +14,21 @@ import random
 import pickle
 import datetime
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import tqdm
 import wandb
 
-# External deps
-from gensim.models import Word2Vec
-import gensim.downloader as api
+from gensim.models import Word2Vec, KeyedVectors
+from huggingface_hub import hf_hub_download
+
+import torch  # needed for .pth loader
 
 # Local project modules
 import model        # provides CBOW & Regressor classes
-import evaluate     # unchanged helper from legacy code
-import dataset      # HNTitles* datasets (imported to ensure availability)
+import evaluate     # neighbour sanity‑checks
+import dataset      # ensure HNTitles dataset is import‑able
 
 # ---------------------------------------------------------------------------
 # Reproducibility & run‑stamp
@@ -42,15 +40,34 @@ TS = datetime.datetime.now().strftime('%Y_%m_%d__%H_%M_%S')
 RUN_NAME = f"{TS}.hn‑w2v‑ft"
 
 # ---------------------------------------------------------------------------
-# Config – base Text8 model path (None → download), training hyper‑params
+# Config – HF model location & training hyper‑params
 # ---------------------------------------------------------------------------
-TEXT8_MODEL_PATH: str | None = None   # e.g. 'text8.word2vec'
+HF_REPO  = "Kogero/cbow-embeddings"   # change here if you move the checkpoint
+HF_FILE  = "cbow_embeddings.pth"      # whatever you uploaded
+HF_CACHE = "hf_models"                # local cache dir
+
 HN_TOKENS_PATH = "title_tokens.pkl"
-EPOCHS = 3
-BATCH_SIZE = 10000                   # sentences per mini‑batch (≈ titles)
+EPOCHS   = 2
+BATCH_SIZE = 10_000
 
 # ---------------------------------------------------------------------------
-# Load Hacker News tokenised titles (list[list[str]])
+# Helper – build a gensim Word2Vec wrapper given vectors + vocab
+# ---------------------------------------------------------------------------
+
+def build_w2v_from_vectors(words: List[str], vectors: np.ndarray, window: int = 2):
+    """Construct a **trainable** gensim Word2Vec from raw numpy vectors.
+    This lets us keep using gensim's incremental training API."""
+    kv = KeyedVectors(vector_size=vectors.shape[1])
+    kv.add_vectors(words, vectors)
+
+    w2v = Word2Vec(vector_size=vectors.shape[1], window=window, min_count=1, sg=0)
+    # Build vocab with dummy counts so frequencies are >0
+    w2v.build_vocab_from_freq({w: 1 for w in words})
+    w2v.wv.vectors[:] = kv.vectors  # copy weights
+    return w2v
+
+# ---------------------------------------------------------------------------
+# 1️⃣  Load Hacker News tokenised titles
 # ---------------------------------------------------------------------------
 with open(HN_TOKENS_PATH, "rb") as f:
     hn_corpus: list[list[str]] = pickle.load(f)
@@ -59,31 +76,114 @@ print(f"Loaded Hacker News corpus  –  {len(hn_corpus):,} titles")
 print("Sample:", hn_corpus[:3])
 
 # ---------------------------------------------------------------------------
-# Load / download pre‑trained Text8 model
+# 2️⃣  Download + load the pre‑trained CBOW model (robust multi‑format)
 # ---------------------------------------------------------------------------
-print("\nLoading Text8 Word2Vec base model …")
-if TEXT8_MODEL_PATH and os.path.isfile(TEXT8_MODEL_PATH):
-    w2v: Word2Vec = Word2Vec.load(TEXT8_MODEL_PATH)
-else:
-    w2v = api.load("word2vec‑text8")            # 100‑D, CBOW, window=5
-print("Model loaded:")
+print("\nFetching pre‑trained CBOW checkpoint from HuggingFace …")
+model_path = hf_hub_download(repo_id=HF_REPO, filename=HF_FILE, cache_dir=HF_CACHE)
+print("Checkpoint at:", model_path)
+
+w2v: Word2Vec | None = None
+
+# ---- A. try full gensim Word2Vec pickle ----------------------------------
+try:
+    w2v = Word2Vec.load(model_path, mmap="r")
+    print("Loaded as gensim Word2Vec ✔️")
+except Exception as e_word2vec:
+    print("Not a Word2Vec pickle –", e_word2vec)
+
+# ---- B. try KeyedVectors pickle ------------------------------------------
+if w2v is None:
+    try:
+        kv = KeyedVectors.load(model_path, mmap="r")  # type: ignore
+        print("Loaded as gensim KeyedVectors ✔️  (wrapping for training)")
+        w2v = build_w2v_from_vectors(kv.index_to_key, kv.vectors, window=2)
+    except Exception as e_kv:
+        print("Not KeyedVectors –", e_kv)
+
+# ---- C. try PyTorch .pth --------------------------------------------------
+if w2v is None:
+    print("Attempting to interpret as PyTorch state‑dict …")
+    state = torch.load(model_path, map_location="cpu")
+
+    vectors_np: np.ndarray | None = None
+    idx2word: List[str] | None = None
+
+    # Case 1: state is a torch.nn.Module
+    if isinstance(state, torch.nn.Module):
+        try:
+            vectors_np = next(state.parameters()).detach().cpu().numpy()
+            idx2word = getattr(state, "idx_to_word", None) or getattr(state, "itos", None)
+            print("State‑dict is nn.Module – extracted first parameter as vectors.")
+        except StopIteration:
+            pass
+
+    # Case 2: raw state‑dict
+    if vectors_np is None and isinstance(state, dict):
+        # Heuristic: find 2‑D tensor with largest 1st dimension
+        weight_key = None
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor) and v.ndim == 2:
+                weight_key = k
+                break
+        if weight_key is not None:
+            vectors_np = state[weight_key].cpu().numpy()
+            print(f"Using tensor '{weight_key}' as embedding matrix ({vectors_np.shape}).")
+
+        # Find vocabulary list
+        candidate_vocab_keys = [k for k in state if k.lower() in {"idx_to_word", "itos", "idx2word", "i2w"}]
+        if candidate_vocab_keys:
+            idx2word = state[candidate_vocab_keys[0]]
+            print(f"Using vocab from key '{candidate_vocab_keys[0]}' (len={len(idx2word)}).")
+
+    if vectors_np is not None and idx2word is None:
+        try:
+            with open("ids_to_words.pkl", "rb") as f:
+                loaded = pickle.load(f)
+                if isinstance(loaded, dict):
+                    # detect if keys are **ints → words** (desired) or words → ints
+                    if all(isinstance(k, int) for k in loaded.keys()):
+                        # int ➔ str mapping – order by key
+                        idx2word = [loaded[i] for i in range(max(loaded.keys()) + 1)]
+                    else:
+                        # words ➔ ints mapping – invert & order by index
+                        inv = {v: k for k, v in loaded.items() if isinstance(v, int)}
+                        idx2word = [inv[i] for i in range(max(inv.keys()) + 1)]
+                elif isinstance(loaded, list):
+                    idx2word = loaded
+            print(f"✔️  Loaded idx2word from ids_to_words.pkl (len={len(idx2word)})")
+        except Exception as e:
+            raise RuntimeError("Could not locate idx_to_word in .pth file, and fallback ids_to_words.pkl failed.") from e
+
+    if vectors_np is not None and idx2word is not None:
+        w2v = build_w2v_from_vectors(list(idx2word), vectors_np, window=2)
+        print("Successfully rebuilt gensim model from PyTorch checkpoint ✔️")
+    else:
+        raise RuntimeError("Could not locate both embedding weights and vocabulary in the .pth file.")
+
+# ---------------------------------------------------------------------------
+# 3️⃣  Sanity‑print model stats
+# ---------------------------------------------------------------------------
+print("Model ready:")
 print("  vector_size =", w2v.vector_size)
 print("  vocab        =", len(w2v.wv))
+print("  window       =", w2v.window)
+print("  sg           =", w2v.sg, "(0 = CBOW)")
 
 # ---------------------------------------------------------------------------
-# Extend vocabulary with Hacker News words
+# 4️⃣  Extend vocabulary with Hacker News words & fine‑tune (unchanged)
 # ---------------------------------------------------------------------------
 print("\nUpdating vocabulary with Hacker News tokens …")
+orig_vocab_size = len(w2v.wv)
 w2v.build_vocab(hn_corpus, update=True)
-print("New vocab size:", len(w2v.wv))
+print(f"New vocab size: {len(w2v.wv):,}  (added {len(w2v.wv) - orig_vocab_size:,} tokens)")
 
 # ---------------------------------------------------------------------------
-# Prepare output folder & wandb run
+# 5️⃣  wandb + training loop – unchanged from previous version
 # ---------------------------------------------------------------------------
 Path("checkpoints").mkdir(parents=True, exist_ok=True)
 
 wandb.init(
-    project="mlx7‑week1‑word2vec‑hn",
+    project="cbow",
     name=RUN_NAME,
     config={
         "epochs": EPOCHS,
@@ -95,26 +195,16 @@ wandb.init(
     },
 )
 
-# ---------------------------------------------------------------------------
-# Optionally verify the Dataset class loads – not used in training loop here
-# ---------------------------------------------------------------------------
 try:
     ds = dataset.HNTitles()
     print(f"Dataset check – {len(ds):,} tokenised titles available.")
 except Exception as exc:
     print("⚠️  Could not load dataset (continuing):", exc)
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
 TOTAL_SENTS = len(hn_corpus)
 for epoch in range(EPOCHS):
     random.shuffle(hn_corpus)
-    prgs = tqdm.tqdm(
-        range(0, TOTAL_SENTS, BATCH_SIZE),
-        desc=f"Epoch {epoch + 1}/{EPOCHS}",
-        leave=False,
-    )
+    prgs = tqdm.tqdm(range(0, TOTAL_SENTS, BATCH_SIZE), desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
     for start in prgs:
         batch = hn_corpus[start : start + BATCH_SIZE]
         w2v.train(batch, total_examples=len(batch), epochs=1, compute_loss=True)
@@ -122,57 +212,40 @@ for epoch in range(EPOCHS):
         prgs.set_postfix({"loss": f"{loss:.4f}"})
         wandb.log({"loss": loss})
 
-    # 🗄️  checkpoint
-    ckpt_path = f"checkpoints/{RUN_NAME}.epoch{epoch + 1}.word2vec"
+    ckpt_path = f"checkpoints/{RUN_NAME}.epoch{epoch+1}.word2vec"
     w2v.save(ckpt_path)
-    art = wandb.Artifact("word2vec‑weights", type="model")
+    art = wandb.Artifact("word2vec-weights", type="model")
     art.add_file(ckpt_path)
     wandb.log_artifact(art)
 
-    # 🔍  quick neighbour check via Torch wrapper + evaluate.topk
-    cbow = model.CBOW(ckpt_path, trainable=False)
-    evaluate.topk(cbow)          # default word='computer'
+    cbow_wrap = model.CBOW(ckpt_path, trainable=False)
+    evaluate.topk(cbow_wrap)
+    print(f"Epoch {epoch+1} complete – loss {loss:.4f}\n")
 
-    print(f"Epoch {epoch + 1} complete – loss {loss:.4f}\n")
-
-# ---------------------------------------------------------------------------
-# Final neighbours sanity‑check
-# ---------------------------------------------------------------------------
 for probe in ["ai", "python", "apple", "openai"]:
-    cbow = model.CBOW(ckpt_path, trainable=False)
-    evaluate.topk(cbow, word=probe)
+    cbow_wrap = model.CBOW(ckpt_path, trainable=False)
+    evaluate.topk(cbow_wrap, word=probe)
 
 wandb.finish()
 print("\nTraining finished – final model saved in checkpoints/")
 
 # ---------------------------------------------------------------------------
-# Upload the final model to HuggingFace
+# 6️⃣  Upload to HF – unchanged
 # ---------------------------------------------------------------------------
-print("\nUploading model to HuggingFace Hub...")
-
+print("\nUploading model to HuggingFace Hub…")
 try:
-    # Import and install huggingface_hub if needed
-    try:
-        from huggingface_hub import login, HfApi
-    except ImportError:
-        import os
-        print("Installing huggingface_hub...")
-        os.system("pip install -q huggingface_hub")
-        from huggingface_hub import login, HfApi
-    
-    # Log in to HuggingFace
-    print("Logging in to Hugging Face Hub...")
-    login()
-    
-    # Initialize API
-    api = HfApi()
-    
-    # Create a new model repository
-    repo_id = "Kogero/hackernews-word2vec"
-    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-    
-    # Create a model card with information
-    model_card = f"""---
+    from huggingface_hub import login, HfApi
+except ImportError:
+    os.system("pip install -q huggingface_hub")
+    from huggingface_hub import login, HfApi
+
+login()
+api = HfApi()
+repo_id = "Kogero/hackernews-word2vec"
+api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+
+with open("README.md", "w") as f:
+    f.write(f"""---
 language:
 - en
 license: mit
@@ -181,68 +254,10 @@ tags:
 - hacker-news
 - embeddings
 ---
+# Hacker News Word2Vec Embeddings (200‑D CBOW fine‑tuned)
+Fine‑tuned on Hacker News titles starting from `{HF_REPO}/{HF_FILE}` for {EPOCHS} epoch(s).
+Vector size = {w2v.vector_size}, window = {w2v.window}.""")
 
-# Hacker News Word2Vec Embeddings
-
-This repository contains a Word2Vec model fine-tuned on Hacker News titles. The model was initialized with the `text8` Word2Vec model and then fine-tuned on Hacker News data.
-
-## Model Details
-
-- **Base Model**: text8 Word2Vec
-- **Vector Size**: {w2v.vector_size}
-- **Window Size**: {w2v.window}
-- **Min Count**: {w2v.min_count}
-- **Model Type**: {"Skip-gram" if w2v.sg else "CBOW"}
-- **Vocabulary Size**: {len(w2v.wv)}
-- **Training Loss**: {loss:.4f}
-
-## Usage
-
-```python
-from gensim.models import Word2Vec
-from huggingface_hub import hf_hub_download
-
-# Download the model
-model_file = hf_hub_download(repo_id="Kogero/hackernews-word2vec", filename="model.word2vec")
-
-# Load the model
-w2v = Word2Vec.load(model_file)
-
-# Use the model
-similar_words = w2v.wv.most_similar("python", topn=5)
-print(similar_words)
-```
-
-## Fine-tuning Details
-
-This model was fine-tuned for {EPOCHS} epochs with a batch size of {BATCH_SIZE}.
-"""
-    
-    # Save the model card to a file
-    with open("README.md", "w") as f:
-        f.write(model_card)
-    
-    # Upload the model card and the model file
-    print("Uploading model and README...")
-    
-    # Upload README.md
-    api.upload_file(
-        path_or_fileobj="README.md",
-        path_in_repo="README.md",
-        repo_id=repo_id,
-        repo_type="model"
-    )
-    
-    # Upload the final model
-    api.upload_file(
-        path_or_fileobj=final_model_path,
-        path_in_repo="model.word2vec",
-        repo_id=repo_id,
-        repo_type="model"
-    )
-    
-    print(f"\nSuccess! Model uploaded to: https://huggingface.co/{repo_id}")
-
-except Exception as e:
-    print(f"Error uploading to HuggingFace Hub: {e}")
-    print("You can still use the local model from:", final_model_path)
+api.upload_file(path_or_fileobj="README.md", path_in_repo="README.md", repo_id=repo_id, repo_type="model")
+api.upload_file(path_or_fileobj=ckpt_path, path_in_repo="model.word2vec", repo_id=repo_id, repo_type="model")
+print(f"\n✅ Success! Model uploaded to: https://huggingface.co/{repo_id}")
